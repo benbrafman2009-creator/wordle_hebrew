@@ -1,0 +1,12 @@
+word = "מילה"
+PORT = 8080
+SIZE_HEADER_FORMAT = "00000000|"
+size_header_size = len(SIZE_HEADER_FORMAT)
+TCP_DEBUG = True
+LEN_TO_PRINT = 100
+color = "color"
+play_solo = "alone"
+join = "join"
+ask_for_rooms = "rooms"
+start_solo_game = "accept"
+create_room = "צור"
