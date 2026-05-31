@@ -1,0 +1,1148 @@
+import pickle
+import tkinter as tk
+import customtkinter as tkcu
+import socket
+import threading
+from tkinter import messagebox
+import time
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.asymmetric import padding
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import dh
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+import os
+import pygame
+import pygame.freetype
+import queue
+import const
+
+__author__ = "Ben"
+IP = "127.0.0.1"
+PORT = 8080
+SIZE_HEADER_FORMAT = "00000000|"
+size_header_size = len(SIZE_HEADER_FORMAT)
+TCP_DEBUG = True
+LEN_TO_PRINT = 100
+
+tkcu.set_appearance_mode("dark")
+
+FONT_TITLE = ("Segoe UI", 20, "bold")
+FONT_LABEL = ("Segoe UI", 11)
+FONT_ENTRY = ("Segoe UI", 12)
+FONT_BTN = ("Segoe UI", 12, "bold")
+
+CLR_BG = "#1a1a2e"
+CLR_SURFACE = "#16213e"
+CLR_ACCENT = "#0f3460"
+CLR_HILIGHT = "#e94560"
+CLR_TEXT = "#eaeaea"
+CLR_MUTED = "#8899aa"
+
+ENTRY_KWARGS = dict(
+    font=FONT_ENTRY,
+    fg_color="#0d1b2a",
+    border_color="#0f3460",
+    border_width=2,
+    text_color=CLR_TEXT,
+    corner_radius=8,
+    height=38,
+    width=220,
+)
+
+LABEL_KWARGS = dict(
+    font=FONT_LABEL,
+    text_color=CLR_MUTED,
+)
+
+BTN_PRIMARY = dict(
+    font=FONT_BTN,
+    fg_color=CLR_HILIGHT,
+    hover_color="#c73652",
+    text_color="white",
+    corner_radius=8,
+    height=40,
+)
+
+BTN_SECONDARY = dict(
+    font=("Segoe UI", 11),
+    fg_color=CLR_ACCENT,
+    hover_color="#1a4a80",
+    text_color=CLR_TEXT,
+    corner_radius=8,
+    height=36,
+)
+
+
+class HandelCommunication(socket.socket):
+    def __init__(self):
+        super().__init__(socket.AF_INET, socket.SOCK_STREAM)
+        self.connect((IP, PORT))
+        self.online_users = []
+        self._response_queue = queue.Queue()
+        self.aes_key = AESGCM.generate_key(bit_length=256)
+        self.aes_obj = AESGCM(self.aes_key)
+        self.associated_data = b"Bentheking"
+        # Start listening thread
+        threading.Thread(target=self._listen_loop, daemon=True).start()
+        self.game_id = None
+    def _listen_loop(self):
+        """Continuously listen for responses in background thread"""
+        while True:
+            try:
+                data = self._raw_recv()
+                if data:
+                    self._response_queue.put(data)
+            except Exception as e:
+                print(f"Listening error: {e}")
+                break
+
+    def wait_response(self):
+        """Get next queued response"""
+        try:
+            return self._response_queue.get(timeout=5)
+        except queue.Empty:
+            return None
+
+    def _raw_recv(self, buffersize=2048, flags=0):
+        size_header = b''
+        while len(size_header) < size_header_size:
+            chunk = super().recv(size_header_size - len(size_header), flags)
+            if not chunk:
+                return ''
+            size_header += chunk
+        try:
+            data_len = int(size_header[:size_header_size - 1])
+        except ValueError:
+            return ''
+        data = b''
+        while len(data) < data_len:
+            chunk = super().recv(data_len - len(data), flags)
+            if not chunk:
+                return ''
+            data += chunk
+        if TCP_DEBUG:
+            print(f"\nRecv({data_len})>>>{data[:LEN_TO_PRINT]}")
+
+        # Raw (unencrypted) data — key exchange responses, public key PEM, or DH parameters PEM
+        try:
+            decoded = data.decode()
+            if decoded.startswith("KeyT") or decoded.startswith("KeyF") or \
+                    decoded.startswith("-----BEGIN PUBLIC KEY-----") or \
+                    decoded.startswith("-----BEGIN DH PARAMETERS-----"):
+                return decoded
+        except Exception:
+            pass
+
+        # Encrypted message
+        ciphertext = data[:-12]
+        nonce = data[-12:]
+        try:
+            return self.aes_obj.decrypt(nonce, ciphertext, self.associated_data).decode()
+        except Exception as e:
+            print(f"Decryption error: {e}")
+            return ''
+
+    def send(self, bdata, flags=0, key=False):
+        if type(bdata) != bytes:
+            bdata = bdata.encode()
+        if key:
+            header_data = str(len(bdata)).zfill(size_header_size - 1).encode() + b"|"
+            super().send(header_data + bdata)
+            if TCP_DEBUG:
+                print(f"\nSent(raw {len(bdata)})>>>{bdata[:LEN_TO_PRINT]}")
+        else:
+            nonce = os.urandom(12)
+            encode_bdata = self.aes_obj.encrypt(nonce, bdata, self.associated_data)
+            header_data = str(len(encode_bdata) + len(nonce)).zfill(size_header_size - 1).encode() + b"|"
+            super().send(header_data + encode_bdata + nonce)
+            if TCP_DEBUG:
+                print(f"\nSent(enc {len(encode_bdata)})>>>{bdata[:LEN_TO_PRINT]}")
+
+
+class SignUpPage(tk.Frame):
+    def __init__(self, parent, controller, client):
+        super().__init__(parent, bg=CLR_BG)
+        self.client = client
+        self.controller = controller
+        self.button = button_thread(client=self.client)
+
+        self.var_user = tk.StringVar()
+        self.var_email = tk.StringVar()
+        self.var_pw = tk.StringVar()
+        self.var_confirm = tk.StringVar()
+
+        self.columnconfigure(0, weight=1)
+        self.columnconfigure(1, weight=1)
+
+        tkcu.CTkLabel(self, text="Create Account", font=FONT_TITLE,
+                      text_color=CLR_HILIGHT, fg_color=CLR_BG).grid(
+            row=0, column=0, columnspan=2, pady=(30, 20))
+
+        self._make_field("Username", self.var_user, row=1)
+        self._make_field("Email", self.var_email, row=2)
+        self._make_field("Password", self.var_pw, row=3, secret=True)
+        self._make_field("Confirm Password", self.var_confirm, row=4, secret=True)
+
+        tkcu.CTkButton(self, text="Register", command=self.handle_registration,
+                       **BTN_PRIMARY).grid(row=5, column=0, columnspan=2, pady=(20, 6))
+
+        tkcu.CTkButton(self, text="Already have an account? Login",
+                       command=lambda: controller.show_frame(LoginPage),
+                       **BTN_SECONDARY).grid(row=6, column=0, columnspan=2, pady=4)
+
+    def _make_field(self, label_text, textvariable, row, secret=False):
+        tkcu.CTkLabel(self, text=label_text, **LABEL_KWARGS,
+                      fg_color=CLR_BG).grid(row=row, column=0, sticky="e", padx=(10, 6), pady=6)
+        kwargs = dict(ENTRY_KWARGS)
+        if secret:
+            kwargs["show"] = "●"
+        tkcu.CTkEntry(self, textvariable=textvariable, **kwargs).grid(
+            row=row, column=1, sticky="w", padx=(6, 10), pady=6)
+
+    def handle_registration(self):
+        user = self.var_user.get().strip()
+        email = self.var_email.get().strip()
+        pw = self.var_pw.get()
+        confirm = self.var_confirm.get()
+
+        if not user or not email or not pw:
+            messagebox.showwarning("Missing Fields", "All fields are required!")
+        elif pw != confirm:
+            messagebox.showerror("Password Mismatch", "Passwords do not match!")
+        else:
+            worked = self.button.button_Signup(user, email, pw)
+            if worked:
+                self.controller.show_frame(LoginPage)
+            else:
+                messagebox.showinfo("Already Registered", "This user already exists!")
+
+
+class LoginPage(tk.Frame):
+    def __init__(self, parent, controller, client):
+        super().__init__(parent, bg=CLR_BG)
+        self.client = client
+        self.controller = controller
+        self.button = button_thread(client=self.client)
+
+        self.var_user = tk.StringVar()
+        self.var_password = tk.StringVar()
+
+        self.columnconfigure(0, weight=1)
+        self.columnconfigure(1, weight=1)
+
+        tkcu.CTkLabel(self, text="Welcome Back", font=FONT_TITLE,
+                      text_color=CLR_HILIGHT, fg_color=CLR_BG).grid(
+            row=0, column=0, columnspan=2, pady=(30, 20))
+
+        self.segmented_button = tkcu.CTkSegmentedButton(
+            self,
+            values=["RSA", "Diffie-Hellman"],
+            command=self.encode_button,
+            font=("Segoe UI", 11, "bold"),
+            fg_color=CLR_ACCENT,
+            selected_color=CLR_HILIGHT,
+            selected_hover_color="#c73652",
+            unselected_color=CLR_ACCENT,
+            unselected_hover_color="#1a4a80",
+            text_color=CLR_TEXT,
+            corner_radius=8,
+        )
+        self.segmented_button.grid(row=3, column=0, columnspan=2, pady=(0, 10), padx=20, sticky="ew")
+
+        self._make_field("Username", self.var_user, row=4)
+        self._make_field("Password", self.var_password, row=5, secret=True)
+
+        tkcu.CTkButton(self, text="Login", command=self.handle_login,
+                       **BTN_PRIMARY).grid(row=10, column=0, columnspan=2, pady=(20, 6))
+
+        tkcu.CTkButton(self, text="Don't have an account? Sign Up",
+                       command=lambda: controller.show_frame(SignUpPage),
+                       **BTN_SECONDARY).grid(row=12, column=0, columnspan=2, pady=4)
+
+        tkcu.CTkButton(self, text="Forgot password?",
+                       command=lambda: controller.show_frame(ForgotPassword),
+                       **BTN_SECONDARY).grid(row=13, column=0, columnspan=2, pady=4)
+
+    def _make_field(self, label_text, textvariable, row, secret=False):
+        tkcu.CTkLabel(self, text=label_text, **LABEL_KWARGS,
+                      fg_color=CLR_BG).grid(row=row, column=0, sticky="e", padx=(10, 6), pady=6)
+        kwargs = dict(ENTRY_KWARGS)
+        if secret:
+            kwargs["show"] = "●"
+        tkcu.CTkEntry(self, textvariable=textvariable, **kwargs).grid(
+            row=row, column=1, sticky="w", padx=(6, 10), pady=6)
+
+    def handle_login(self):
+        user = self.var_user.get().strip()
+        password = self.var_password.get()
+        encryption = self.segmented_button.get()
+        if not user or not password or not encryption:
+            messagebox.showwarning("Missing Fields", "All fields are required!")
+        else:
+            worked = self.button.button_Login(user, password)
+            if worked == "LoginS":
+                self.controller.show_frame(EmailPassword)
+                self.controller.frames[EmailPassword].start_timer_display("login")
+                self.client._current_user = user
+            elif worked == "LoginF":
+                messagebox.showinfo("Login Failed", "Wrong username or password!")
+            elif worked == "LoginNotAb":
+                messagebox.showinfo("Login Failed", "This user is already logged in!")
+
+    def encode_button(self, encryption):
+        worked = self.button.button_encrypt(encryption)
+        if worked:
+            if encryption == "RSA":
+                threading.Thread(target=self.RSA, daemon=True).start()
+            elif encryption == "Diffie-Hellman":
+                threading.Thread(target=self.Diffie_Hellman, daemon=True).start()
+        else:
+            messagebox.showinfo("Support", "Don't support this method")
+
+    def RSA(self):
+        # Request server's public key
+        self.client.send("PublicKey", key=True)
+        pem_public = self.client.wait_response()
+
+        # Load the public key object
+        public_key = serialization.load_pem_public_key(pem_public.encode())
+
+        # Encrypt our AES key with the server's public key
+        encrypted_aes_key = public_key.encrypt(
+            self.client.aes_key,
+            padding.OAEP(
+                mgf=padding.MGF1(algorithm=hashes.SHA256()),
+                algorithm=hashes.SHA256(),
+                label=None
+            )
+        )
+        # Send encrypted AES key — raw, not AES-encrypted
+        self.client.send(b"aes:" + encrypted_aes_key, key=True)
+        print("RSA key exchange complete.")
+
+    def Diffie_Hellman(self):
+        # Receive DH parameters PEM from server and deserialize
+        params_pem = self.client.wait_response()
+        parameters = serialization.load_pem_parameters(params_pem.encode())
+
+        # Generate client private key and derive public key
+        b = parameters.generate_private_key()
+        B = b.public_key()
+        B_pem = B.public_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo)
+
+        # Send our public key to server — unencrypted (no AES yet)
+        self.client.send(B_pem, key=True)
+
+        # Receive server's public key
+        A_pem = self.client.wait_response()
+        A = serialization.load_pem_public_key(A_pem.encode())
+
+        # Derive shared AES key
+        shared_key = b.exchange(A)
+        derived_key = HKDF(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=None,
+            info=b"handshake data",
+        ).derive(shared_key)
+
+        # Update the client's AES object with the derived key
+        self.client.aes_key = derived_key
+        self.client.aes_obj = AESGCM(derived_key)
+
+        # Tell server our derived key — unencrypted (AES not yet confirmed on server)
+        self.client.send(b"aes:" + derived_key, key=True)
+        print("Diffie-Hellman key exchange complete.")
+
+
+class ForgotPassword(tk.Frame):
+    def __init__(self, parent, controller, client):
+        super().__init__(parent, bg=CLR_BG)
+        self.client = client
+        self.controller = controller
+        self.button = button_thread(client=self.client)
+        self.var_user = tk.StringVar()
+
+        self.columnconfigure(0, weight=1)
+        self.columnconfigure(1, weight=1)
+
+        tkcu.CTkLabel(self, text="Forgot Password", font=FONT_TITLE,
+                      text_color=CLR_HILIGHT, fg_color=CLR_BG).grid(
+            row=0, column=0, columnspan=2, pady=(30, 20))
+
+        self._make_field("Username", self.var_user, row=1)
+
+        self.lbl_status = tkcu.CTkLabel(self, text="", font=FONT_LABEL,
+                                        fg_color=CLR_BG, text_color=CLR_MUTED)
+        self.lbl_status.grid(row=2, column=0, columnspan=2, pady=4)
+
+        tkcu.CTkButton(self, text="Send verification email", command=self.handle_forgot,
+                       **BTN_PRIMARY).grid(row=3, column=0, columnspan=2, pady=(16, 6))
+
+        tkcu.CTkButton(self, text="Back to Login",
+                       command=lambda: controller.show_frame(LoginPage),
+                       **BTN_SECONDARY).grid(row=4, column=0, columnspan=2, pady=4)
+
+    def handle_forgot(self):
+        user = self.var_user.get().strip()
+        if not user:
+            messagebox.showwarning("Missing Fields", "Please enter your username.")
+            return
+        self.client.send(f"ForgotPassword:{user}")
+        resp = self.client.wait_response()
+        if resp == "ForgotS":
+            self.controller.show_frame(EmailPassword)
+            self.controller.frames[EmailPassword].start_timer_display("forgot")
+        else:
+            messagebox.showerror("Not Found", "No account with that username.")
+
+    def _make_field(self, label_text, textvariable, row, secret=False):
+        tkcu.CTkLabel(self, text=label_text, **LABEL_KWARGS,
+                      fg_color=CLR_BG).grid(row=row, column=0, sticky="e", padx=(10, 6), pady=6)
+        kwargs = dict(ENTRY_KWARGS)
+        if secret:
+            kwargs["show"] = "●"
+        tkcu.CTkEntry(self, textvariable=textvariable, **kwargs).grid(
+            row=row, column=1, sticky="w", padx=(6, 10), pady=6)
+
+
+class EmailPassword(tk.Frame):
+    def __init__(self, parent, controller, client):
+        super().__init__(parent, bg=CLR_BG)
+        self.client = client
+        self.controller = controller
+        self.button = button_thread(client=self.client)
+        self.var_password = tk.StringVar()
+        self._waiting = False
+        self._tick_id = None
+        self._watch_id = None
+        self._source = ""
+
+        tkcu.CTkLabel(self, text="Check your mailbox", font=FONT_TITLE,
+                      text_color=CLR_HILIGHT, fg_color=CLR_BG).grid(
+            row=0, column=0, columnspan=2, pady=(30, 20))
+
+        self._make_field("Code", self.var_password, row=1, secret=True)
+
+        self.lbl_timer = tkcu.CTkLabel(self, text="⏳ 5:00 remaining", font=FONT_LABEL,
+                                       fg_color=CLR_BG, text_color=CLR_MUTED)
+        self.lbl_timer.grid(row=2, column=0, columnspan=2, pady=4)
+
+        tkcu.CTkButton(self, text="Check", command=self.handle_password_check,
+                       **BTN_PRIMARY).grid(row=3, column=0, columnspan=2, pady=(20, 6))
+
+    def start_timer_display(self, source):
+        self._waiting = False
+        if self._tick_id is not None:
+            self.after_cancel(self._tick_id)
+            self._tick_id = None
+        if self._watch_id is not None:
+            self.after_cancel(self._watch_id)
+            self._watch_id = None
+
+        self._source = source
+        self._seconds_left = 300
+        self._waiting = True
+        self._tick_id = self.after(0, self._tick)
+        # Start polling from main thread instead of daemon thread
+        self._watch_id = self.after(100, self._watch_for_timeout)
+
+    def _tick(self):
+        self._tick_id = None
+        if not self._waiting:
+            return
+        mins, secs = divmod(self._seconds_left, 60)
+        self.lbl_timer.configure(text=f"⏳ {mins}:{secs:02d} remaining")
+        if self._seconds_left > 0:
+            self._seconds_left -= 1
+            self._tick_id = self.after(1000, self._tick)
+
+    def _watch_for_timeout(self):
+        """Poll queue from main thread every 100ms - no background thread!"""
+        self._watch_id = None
+
+        if not self._waiting:
+            return
+
+        try:
+            resp = self.client._response_queue.get(timeout=0.01)
+            if resp == "EmailTimeout":
+                self._waiting = False
+                self._on_timeout()
+            else:
+                # Put it back if it's not what we wanted
+                self.client._response_queue.put(resp)
+        except queue.Empty:
+            pass
+
+        # Schedule next check
+        if self._waiting:
+            self._watch_id = self.after(100, self._watch_for_timeout)
+
+    def _on_timeout(self):
+        self._waiting = False
+        if self._tick_id is not None:
+            self.after_cancel(self._tick_id)
+            self._tick_id = None
+        messagebox.showinfo("Time Expired", "The email verification code has expired.\nPlease log in again.")
+        self.controller.show_frame(LoginPage)
+
+    def handle_password_check(self):
+        password = self.var_password.get()
+        self._waiting = False
+        if self._watch_id is not None:
+            self.after_cancel(self._watch_id)
+            self._watch_id = None
+
+        answer = self.button.email_password_check(password)
+        if answer and self._source == "login":
+            self.controller.show_frame(MenuWordle)
+        elif answer and self._source == "forgot":
+            user = self.controller.frames[ForgotPassword].var_user.get().strip()
+            self.controller.frames[ResetPassword].set_user(user)
+            self.controller.show_frame(ResetPassword)
+        else:
+            self._waiting = True
+            self._watch_id = self.after(100, self._watch_for_timeout)
+            messagebox.showinfo("Wrong code", "The code you entered is incorrect.")
+
+    def _make_field(self, label_text, textvariable, row, secret=False):
+        tkcu.CTkLabel(self, text=label_text, **LABEL_KWARGS,
+                      fg_color=CLR_BG).grid(row=row, column=0, sticky="e", padx=(10, 6), pady=6)
+        kwargs = dict(ENTRY_KWARGS)
+        if secret:
+            kwargs["show"] = "●"
+        tkcu.CTkEntry(self, textvariable=textvariable, **kwargs).grid(
+            row=row, column=1, sticky="w", padx=(6, 10), pady=6)
+
+
+class ResetPassword(tk.Frame):
+    def __init__(self, parent, controller, client):
+        super().__init__(parent, bg=CLR_BG)
+        self.client = client
+        self.controller = controller
+        self.button = button_thread(client=self.client)
+        self._user = ""
+        self.var_pw = tk.StringVar()
+        self.var_confirm = tk.StringVar()
+
+        self.columnconfigure(0, weight=1)
+        self.columnconfigure(1, weight=1)
+
+        tkcu.CTkLabel(self, text="Reset Password", font=FONT_TITLE,
+                      text_color=CLR_HILIGHT, fg_color=CLR_BG).grid(
+            row=0, column=0, columnspan=2, pady=(30, 20))
+
+        self._make_field("New Password", self.var_pw, row=1, secret=True)
+        self._make_field("Confirm Password", self.var_confirm, row=2, secret=True)
+
+        self.lbl_status = tkcu.CTkLabel(self, text="", font=FONT_LABEL,
+                                        fg_color=CLR_BG, text_color=CLR_MUTED)
+        self.lbl_status.grid(row=3, column=0, columnspan=2, pady=4)
+
+        tkcu.CTkButton(self, text="Reset Password", command=self.handle_reset,
+                       **BTN_PRIMARY).grid(row=4, column=0, columnspan=2, pady=(16, 6))
+
+    def set_user(self, user):
+        self._user = user
+
+    def handle_reset(self):
+        pw = self.var_pw.get()
+        confirm = self.var_confirm.get()
+        if not pw:
+            messagebox.showwarning("Missing Fields", "Please enter a new password.")
+            return
+        if pw != confirm:
+            messagebox.showerror("Mismatch", "Passwords do not match!")
+            return
+        resp = self.button.button_reset_password(self._user, pw)
+        if resp:
+            messagebox.showinfo("Success", "Password reset successfully!")
+            self.var_pw.set("")
+            self.var_confirm.set("")
+            self.controller.show_frame(MenuWordle)
+        else:
+            self.lbl_status.configure(text="Reset failed. Try again.", text_color=CLR_HILIGHT)
+
+    def _make_field(self, label_text, textvariable, row, secret=False):
+        tkcu.CTkLabel(self, text=label_text, **LABEL_KWARGS,
+                      fg_color=CLR_BG).grid(row=row, column=0, sticky="e", padx=(10, 6), pady=6)
+        kwargs = dict(ENTRY_KWARGS)
+        if secret:
+            kwargs["show"] = "●"
+        tkcu.CTkEntry(self, textvariable=textvariable, **kwargs).grid(
+            row=row, column=1, sticky="w", padx=(6, 10), pady=6)
+
+
+class MenuWordle(tk.Frame):
+    def __init__(self, parent, controller, client):
+        super().__init__(parent, bg=CLR_BG)
+        self.parent = parent
+        self.client = client
+        self.controller = controller
+        self.button = button_thread(client=self.client)
+
+        # START LISTENING FOR INCOMING INVITES
+        self.invite_listener_thread = threading.Thread(
+            target=self._listen_for_invites,
+            daemon=True
+        )
+        self.invite_listener_thread.start()
+        # 1. Title
+        tkcu.CTkLabel(self, text="Wordle Game", font=FONT_TITLE,
+                      text_color=CLR_HILIGHT, fg_color=CLR_BG).pack(pady=(30, 10))
+
+        # 2. Word Length Slider Section
+        tkcu.CTkLabel(self, text="Select Word Length:", font=("Arial", 14),
+                      text_color="white").pack(pady=(10, 0))
+
+        # Variable to store the slider value
+        self.word_len_var = tk.IntVar(value=5)
+
+        # Slider (from 5 to 8, with 3 steps to ensure whole numbers)
+        self.slider = tkcu.CTkSlider(self, from_=5, to=8,
+                                     number_of_steps=3,
+                                     variable=self.word_len_var,
+                                     button_color=CLR_HILIGHT,
+                                     progress_color=CLR_HILIGHT)
+        self.slider.pack(pady=(5, 10))
+
+        # Label that updates to show the selected number
+        self.lbl_value = tkcu.CTkLabel(self, textvariable=self.word_len_var, font=("Arial", 16, "bold"))
+        self.lbl_value.pack()
+
+        # 3. Action Buttons
+        tkcu.CTkButton(self, text="Start Game Alone",
+                       command=self.start_alone, **BTN_PRIMARY).pack(pady=10)
+
+        tkcu.CTkButton(self, text="Invite Someone",
+                       command=self.invite_friend, **BTN_PRIMARY).pack(pady=10)
+
+        tkcu.CTkButton(self, text="Back to Login",
+                       command=self.handle_logout,
+                       **BTN_SECONDARY).pack(pady=(20, 10))
+
+        # Status label for errors/notifications
+        self.lbl_status = tkcu.CTkLabel(self, text="", text_color="#facc15")
+        self.lbl_status.pack(pady=5)
+
+    def _listen_for_invites(self):
+        """Background thread that listens for incoming game invites and game start signals"""
+        while True:
+            try:
+                if self.client._response_queue.qsize() > 0:
+                    msg = self.client._response_queue.get(timeout=0.5)
+
+                    if isinstance(msg, str) and msg.startswith(const.INVITE_REQUEST):
+                        self._handle_incoming_invite(msg)
+
+                    # 2. Check if this is the start signal for a game WE hosted/joined
+                    elif isinstance(msg, str) and msg.startswith(const.START_MULTIPLAYER):
+                        print(f"[GAME START] Received multiplayer launch signal: {msg}")
+
+                        parts = msg.split(":")[1].split(";")
+                        word_size = int(parts[1])
+                        players = parts[0].split(",")
+                        host_player = players[0]
+                        game_id = parts[2] if len(parts) > 2 else None
+                        self.client.game_id = game_id  # store so submit_row can send it
+
+                        self.after(0, lambda w=word_size, p=players, h=host_player: self.controller.run_game(
+                            solo=False,
+                            length=w,
+                            other_players=p,
+                            inviter=h
+                        ))
+
+                    else:
+                        # Put it back if it's unrelated data (like a login or leaderboard response)
+                        self.client._response_queue.put(msg)
+
+                time.sleep(0.5)  # Check every 500ms
+            except queue.Empty:
+                time.sleep(0.5)
+            except Exception as e:
+                print(f"[INVITE LISTENER ERROR] {e}")
+                time.sleep(1)
+
+    def _handle_incoming_invite(self, msg):
+        """Parse and display incoming invite dialog"""
+        try:
+            # Format: "invite_request:inviter;word_size"
+            parts = msg.split(":")[1].split(";")
+            inviter = parts[0]
+            word_size = int(parts[1])
+
+            print(f"[INVITE] Received invite from {inviter} for {word_size}-letter game")
+
+            # Show dialog in main thread
+            self.after(0, lambda: self._show_invite_dialog(inviter, word_size))
+        except Exception as e:
+            print(f"[ERROR] Failed to parse invite: {e}")
+
+    def _show_invite_dialog(self, inviter, word_size):
+        result = messagebox.askyesno(
+            "Game Invite",
+            f"{inviter} invited you to a {word_size}-letter Wordle game!\n\nAccept?"
+        )
+
+        if result:  # Accept
+            print(f"[ACCEPT] Accepting invite from {inviter}")
+            self.client.send(f"{const.INVITE_ACCEPT}:{inviter};{word_size}")
+        else:  # Reject
+            print(f"[REJECT] Rejecting invite from {inviter}")
+            self.client.send(f"{const.INVITE_REJECT}:{inviter}")
+
+    def start_alone(self):
+        word_size = self.word_len_var.get()
+        print(f"Starting solo game with {word_size} letters...")
+        self.controller.run_game(solo=True, length=word_size)
+
+    def invite_friend(self):
+        word_size = self.word_len_var.get()
+        self.client.send(const.ask_for_rooms)
+
+        response = self.client.wait_response()
+        if response is None:
+            messagebox.showerror("Error", "Server didn't respond. Try again.")
+            return
+
+        try:
+            names_list = eval(response)
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to parse users: {str(e)}")
+            return
+
+        if not names_list:
+            messagebox.showinfo("No Users", "No other users are currently available to invite.")
+            return
+
+        popup = tk.Toplevel(self.parent)
+        popup.title("Invite a Player")
+        popup.geometry("320x400")
+        popup.resizable(True, True)
+        popup.configure(bg=CLR_BG)
+
+        tk.Label(
+            popup,
+            text=f"Select a player ({word_size}-letter game):",
+            font=("Segoe UI", 12, "bold"),
+            bg=CLR_BG, fg=CLR_TEXT
+        ).pack(pady=(14, 8))
+
+        frame = tk.Frame(popup, bg=CLR_BG)
+        frame.pack(fill=tk.BOTH, expand=True, padx=14, pady=4)
+
+        canvas = tk.Canvas(frame, bg=CLR_BG, highlightthickness=0)
+        scrollbar = tk.Scrollbar(frame, orient=tk.VERTICAL, command=canvas.yview)
+        inner = tk.Frame(canvas, bg=CLR_BG)
+        inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=inner, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        def send_invite(name):
+            self.client.send(f"{const.INVITE_REQUEST}:{name};{word_size}")
+            messagebox.showinfo("Invite Sent", f"Invite sent to {name}!\nWaiting for them to respond...")
+            popup.destroy()
+
+        for name in names_list:
+            row = tk.Frame(inner, bg=CLR_BG)
+            row.pack(fill=tk.X, pady=5, padx=8)
+
+            tk.Label(row, text=name, font=("Segoe UI", 11),
+                     bg=CLR_BG, fg=CLR_TEXT, anchor="w", width=18).pack(side=tk.LEFT)
+
+            tk.Button(
+                row, text="Invite",
+                font=("Segoe UI", 9, "bold"),
+                bg=CLR_HILIGHT, fg="white",
+                relief=tk.FLAT, padx=10,
+                command=lambda n=name: send_invite(n)
+            ).pack(side=tk.LEFT, padx=6)
+
+        tk.Button(
+            popup, text="Cancel",
+            font=("Segoe UI", 10),
+            bg=CLR_ACCENT, fg=CLR_TEXT,
+            relief=tk.FLAT, padx=12,
+            command=popup.destroy
+        ).pack(pady=10)
+
+    def handle_logout(self):
+        toDisconnect = self.button.button_Logout()
+        if toDisconnect:
+            self.controller.show_frame(LoginPage)
+        else:
+            self.lbl_status.configure(text="Server error", text_color="#facc15")
+
+PAGESNAMES = [LoginPage, SignUpPage, ForgotPassword, ResetPassword, MenuWordle, EmailPassword]
+
+
+class MainApp(tk.Tk):
+    def __init__(self, client):
+        super().__init__()
+        self.title("Encode Chat")
+        self.geometry("520x420")
+        self.configure(bg=CLR_BG)
+        self.resizable(False, False)
+        self.client = client
+        self.words = self.load_words()
+        container = tk.Frame(self, bg=CLR_BG)
+        container.pack(fill="both", expand=True)
+        container.grid_rowconfigure(0, weight=1)
+        container.grid_columnconfigure(0, weight=1)
+        self.frames = {}
+        for F in PAGESNAMES:
+            frame = F(parent=container, controller=self, client=client)
+            self.frames[F] = frame
+            frame.grid(row=0, column=0, sticky="nsew")
+
+        self.show_frame(LoginPage)
+
+    def show_frame(self, page_name):
+        frame = self.frames[page_name]
+        frame.tkraise()
+
+    def run_game(self, solo, length, inviter=None, other_players=None):
+        self.withdraw()
+        try:
+            if solo:
+                self.client.game_id = None  # clear any previous multiplayer session
+                self.client.send(f"{const.play_solo};{length}")
+                accept = self.client.wait_response()
+                if accept == const.start_solo_game:
+                    self.start_pygame_loop(solo=True, length=length)
+                else:
+                    print("Server shutdown")
+            else:
+                # Multiplayer game
+                print(f"Starting multiplayer game with {other_players}")
+                self.start_pygame_loop(solo=False, length=length, other_players=other_players, inviter=inviter)
+        finally:
+            self.deiconify()
+
+    def start_pygame_loop(self, solo, length, other_players=None, inviter=None):
+        game_won = False
+        game_lost = False
+        pygame.init()
+
+        WINDOW_WIDTH = 700
+        WINDOW_HEIGHT = 500
+        BOX_SIZE = 60
+        GAP = 10
+        ROWS = 6
+        COLS = length
+
+        try:
+            font_path = os.path.join(os.environ['WINDIR'], 'Fonts', 'arial.ttf')
+            font = pygame.freetype.Font(font_path if os.path.exists(font_path) else None, 40)
+        except:
+            font = pygame.freetype.Font(None, 40)
+
+        board = [["" for _ in range(COLS)] for _ in range(ROWS)]
+        colors_board = [[const.background_color for _ in range(COLS)] for _ in range(ROWS)]
+
+        # async_queue: server-push messages (opponent guesses, game_ended)
+        # my_guess_queue: the server's direct reply to MY submitted guess
+        async_queue = queue.Queue()
+        my_guess_queue = queue.Queue()
+
+        def _bg_listener():
+            """Route server messages: push events go to async_queue, guess replies go to my_guess_queue."""
+            while True:
+                try:
+                    msg = self.client._response_queue.get(timeout=0.3)
+                    if msg and (msg.startswith(const.MULTIPLAYER_OPPONENT_GUESS) or
+                                msg.startswith("game_ended") or
+                                msg.startswith(const.MULTIPLAYER_OPPONENT_WON)):
+                        async_queue.put(msg)
+                    else:
+                        my_guess_queue.put(msg)
+                except queue.Empty:
+                    continue
+                except Exception:
+                    break
+
+        if not solo:
+            threading.Thread(target=_bg_listener, daemon=True).start()
+
+        error = False
+        current_row = 0
+        current_col = 0
+
+        screen = pygame.display.set_mode((WINDOW_WIDTH, WINDOW_HEIGHT))
+        pygame.display.set_caption("Wordle - Solo" if solo else
+                                   f"Wordle - vs {next((p for p in other_players if p != self.client._current_user), '')}")
+        clock = pygame.time.Clock()
+        finish = False
+
+        # Determine whose turn it is — inviter always goes first
+        if not solo:
+            my_name = self.client._current_user
+            opponent_name = next((p for p in other_players if p != my_name), "")
+            current_player_index = 0  # inviter = index 0
+
+        winner_name = ""
+
+        while not finish:
+            is_my_turn = solo or (other_players[current_player_index] == self.client._current_user)
+
+            # Process all pending server-push messages (opponent moves, game end)
+            if not solo:
+                while True:
+                    try:
+                        msg = async_queue.get_nowait()
+                    except queue.Empty:
+                        break
+
+                    if msg.startswith(const.MULTIPLAYER_OPPONENT_GUESS + ":"):
+                        # "opponent_guess:<word>;<color1>;<color2>;..."
+                        payload = msg[len(const.MULTIPLAYER_OPPONENT_GUESS) + 1:]
+                        parts = payload.split(";")
+                        opp_word = parts[0]
+                        raw_colors = [p.strip() for p in parts[1:] if p.strip()]
+
+                        # Paint the opponent's row onto the board
+                        for c_idx, letter in enumerate(opp_word):
+                            board[current_row][c_idx] = letter
+                        for c_idx, color_str in enumerate(raw_colors):
+                            try:
+                                colors_board[current_row][c_idx] = eval(color_str)
+                            except Exception:
+                                pass
+
+                        current_row += 1
+                        current_col = 0
+
+                        # It's now my turn
+                        current_player_index = (current_player_index + 1) % len(other_players)
+
+                        if current_row >= ROWS:
+                            game_lost = True
+
+                    elif msg.startswith("game_ended:"):
+                        winner = msg.split(":")[1].replace("_won", "")
+                        winner_name = winner
+                        game_lost = True
+
+                    elif msg.startswith(const.MULTIPLAYER_OPPONENT_WON + ":"):
+                        winner_name = msg.split(":")[1]
+                        game_lost = True
+
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    finish = True
+
+                if event.type == pygame.KEYDOWN:
+                    if not is_my_turn:
+                        continue
+
+                    if event.key == pygame.K_BACKSPACE:
+                        if current_col > 0:
+                            current_col -= 1
+                            board[current_row][current_col] = ""
+                            error = False
+
+                    elif event.key == pygame.K_RETURN:
+                        if self.check_line(board, current_row, COLS) and current_col == COLS:
+                            result = self.submit_row(
+                                "".join(board[current_row]),
+                                my_guess_queue if not solo else None
+                            )
+
+                            if result is True:
+                                for i in range(COLS):
+                                    colors_board[current_row][i] = const.green
+                                current_row += 1
+                                current_col = 0
+                                game_won = True
+                                winner_name = self.client._current_user
+                            elif result is not None:
+                                for i in range(COLS):
+                                    colors_board[current_row][i] = result[i]
+                                current_row += 1
+                                current_col = 0
+                                error = False
+
+                                # Switch turn to opponent
+                                if not solo:
+                                    current_player_index = (current_player_index + 1) % len(other_players)
+
+                                if current_row >= ROWS and not game_won:
+                                    if solo:
+                                        game_lost = True
+
+                    else:
+                        char = event.unicode
+                        if '\u05d0' <= char <= '\u05ea':
+                            if current_col < COLS:
+                                board[current_row][current_col] = char
+                                current_col += 1
+                                error = False
+
+            screen.fill(const.background_color)
+
+            grid_w = COLS * BOX_SIZE + (COLS - 1) * GAP
+            grid_h = ROWS * BOX_SIZE + (ROWS - 1) * GAP
+            start_x = (WINDOW_WIDTH - grid_w) // 2
+            start_y = (WINDOW_HEIGHT - grid_h) // 2
+
+            for r in range(ROWS):
+                for c in range(COLS):
+                    x = start_x + (COLS - 1 - c) * (BOX_SIZE + GAP)
+                    y = start_y + r * (BOX_SIZE + GAP)
+                    rect = pygame.Rect(x, y, BOX_SIZE, BOX_SIZE)
+                    pygame.draw.rect(screen, colors_board[r][c], rect)
+                    if board[r][c]:
+                        ts, tr = font.render(board[r][c], (255, 255, 255))
+                        tr.center = rect.center
+                        screen.blit(ts, tr)
+                    border = (255, 255, 255) if r == current_row and c == current_col and is_my_turn \
+                        else (70, 70, 70)
+                    pygame.draw.rect(screen, border, rect, 2)
+
+            # Turn indicator
+            if not solo:
+                turn_owner = other_players[current_player_index]
+                turn_text = "Your turn" if is_my_turn else f"{turn_owner}'s turn"
+                color = (100, 220, 100) if is_my_turn else (220, 100, 100)
+                ts, _ = font.render(turn_text, color, size=22)
+                screen.blit(ts, (WINDOW_WIDTH // 2 - ts.get_width() // 2, 10))
+
+            if error:
+                es, _ = font.render("המילה לא קיימת!"[::-1], (255, 0, 0), size=20)
+                screen.blit(es, ((WINDOW_WIDTH - es.get_width()) // 2, start_y + grid_h + 30))
+
+            if game_won:
+                ws, _ = font.render(("ניצחון!" if solo else f"ניצחת!")[::-1], (0, 255, 0), size=50)
+                screen.blit(ws, (WINDOW_WIDTH // 2 - ws.get_width() // 2, 50))
+                pygame.display.flip()
+                time.sleep(3)
+                finish = True
+
+            elif game_lost:
+                if winner_name and winner_name != self.client._current_user:
+                    lost_text = f"{winner_name} ניצח!"[::-1]
+                else:
+                    lost_text = "כולם הפסידו!"
+                ls, _ = font.render(lost_text, (255, 0, 0), size=50)
+                screen.blit(ls, (WINDOW_WIDTH // 2 - ls.get_width() // 2, 50))
+                pygame.display.flip()
+                time.sleep(3)
+                finish = True
+
+            else:
+                pygame.display.flip()
+
+            clock.tick(60)
+
+        pygame.quit()
+
+    def check_line(self, board, row, length):
+        current_line_letters = [char for char in board[row] if char != ""]
+
+        if len(current_line_letters) == length:
+            word = "".join(board[row])
+            if word in self.words[length]:
+                return True
+            else:
+                print("The word dont exist!")
+                return False
+        else:
+            print("Line is not full yet!")
+            return False
+    def load_words(self):
+        try:
+            with open('hebrew_words', 'rb') as f:
+                data = pickle.load(f)
+            return data
+        except FileNotFoundError:
+            print("File not found.")
+            return None
+        except Exception as e:
+            print(f"Error loading data: {e}")
+            return None
+
+    def submit_row(self, word, guess_queue=None):
+        game_id = self.client.game_id
+        payload = f"{word};{game_id}" if game_id else word
+        self.client.send(const.word + ":" + payload)
+        # In multiplayer the bg_listener routes our reply into guess_queue.
+        # In solo we read directly from the shared response queue.
+        if guess_queue is not None:
+            try:
+                color_str = guess_queue.get(timeout=5)
+            except queue.Empty:
+                return None
+        else:
+            color_str = self.client.wait_response()
+        if color_str is None:
+            return None
+        if color_str.startswith(const.win):
+            return True
+        if color_str.startswith(const.color):
+            color_strings = [c for c in color_str[len(const.color):].split(";") if c]
+            color_list = [eval(c) for c in color_strings]
+            return color_list
+class button_thread(threading.Thread):
+    def __init__(self, client):
+        super().__init__(daemon=True)
+        self.client = client
+
+    def button_Signup(self, user, email, pw):
+        self.client.send(f"SignUp:{user};{email};{pw}")
+        resp = self.client.wait_response()
+        return resp == "SignUpS" if resp in ("SignUpS", "SignUpF") else None
+
+    def button_Login(self, user, password):
+        self.client.send(f"Login:{user};{password}")
+        return self.client.wait_response()
+
+    def button_Logout(self):
+        self.client.send("Logout:")
+        resp = self.client.wait_response()
+        return resp == "LogoutS"
+
+    def email_password_check(self, password):
+        self.client.send("Email:" + password)
+        response = self.client.wait_response()
+        return response == "EmailS"
+
+    def button_reset_password(self, user, new_password):
+        self.client.send(f"ResetPassword:{user};{new_password}")
+        resp = self.client.wait_response()
+        return resp == "ResetS"
+
+    def button_forgot(self, user):
+        self.client.send(f"ForgotPassword:{user}")
+        return self.client.wait_response()
+
+    def button_encrypt(self, encryption_method):
+        self.client.send(encryption_method, key=True)
+        worked = self.client.wait_response()
+        if worked == "KeyT":
+            return True
+        elif worked == "KeyF":
+            return False
+
+
+def main():
+    try:
+        client = HandelCommunication()
+        print("Connected to server!")
+    except Exception as e:
+        print(f"Failed to connect to server: {e}")
+        return
+
+    tkcu.set_default_color_theme("blue")
+    app = MainApp(client)
+    app.mainloop()
+    client.close()
+
+
+if __name__ == "__main__":
+    main()
