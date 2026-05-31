@@ -452,7 +452,7 @@ class HandelCommunication(threading.Thread):
 
             game = game_sessions.get(self.game_id) if self.game_id else None
             target_word = game["word"] if game else self.current_word
-
+            print(target_word)
             if target_word != "":
 
                 if cliword == target_word:

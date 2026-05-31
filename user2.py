@@ -846,22 +846,16 @@ class MainApp(tk.Tk):
         board = [["" for _ in range(COLS)] for _ in range(ROWS)]
         colors_board = [[const.background_color for _ in range(COLS)] for _ in range(ROWS)]
 
-        # async_queue: server-push messages (opponent guesses, game_ended)
-        # my_guess_queue: the server's direct reply to MY submitted guess
-        async_queue = queue.Queue()
-        my_guess_queue = queue.Queue()
+        # Single queue for ALL server messages in multiplayer.
+        # submit_row drains it looking for its own reply; push events stay in queue.
+        game_queue = queue.Queue()
 
         def _bg_listener():
-            """Route server messages: push events go to async_queue, guess replies go to my_guess_queue."""
+            """Forward every server message into game_queue."""
             while True:
                 try:
                     msg = self.client._response_queue.get(timeout=0.3)
-                    if msg and (msg.startswith(const.MULTIPLAYER_OPPONENT_GUESS) or
-                                msg.startswith("game_ended") or
-                                msg.startswith(const.MULTIPLAYER_OPPONENT_WON)):
-                        async_queue.put(msg)
-                    else:
-                        my_guess_queue.put(msg)
+                    game_queue.put(msg)
                 except queue.Empty:
                     continue
                 except Exception:
@@ -895,7 +889,7 @@ class MainApp(tk.Tk):
             if not solo:
                 while True:
                     try:
-                        msg = async_queue.get_nowait()
+                        msg = game_queue.get_nowait()
                     except queue.Empty:
                         break
 
@@ -951,7 +945,7 @@ class MainApp(tk.Tk):
                         if self.check_line(board, current_row, COLS) and current_col == COLS:
                             result = self.submit_row(
                                 "".join(board[current_row]),
-                                my_guess_queue if not solo else None
+                                game_queue if not solo else None
                             )
 
                             if result is True:
@@ -1067,20 +1061,37 @@ class MainApp(tk.Tk):
             print(f"Error loading data: {e}")
             return None
 
-    def submit_row(self, word, guess_queue=None):
+    def submit_row(self, word, game_queue=None):
         game_id = self.client.game_id
         payload = f"{word};{game_id}" if game_id else word
         self.client.send(const.word + ":" + payload)
-        # In multiplayer the bg_listener routes our reply into guess_queue.
-        # In solo we read directly from the shared response queue.
-        if guess_queue is not None:
-            try:
-                color_str = guess_queue.get(timeout=5)
-            except queue.Empty:
-                return None
-        else:
+
+        if game_queue is None:
+            # Solo: read directly from the response queue
             color_str = self.client.wait_response()
-        if color_str is None:
+        else:
+            # Multiplayer: drain game_queue until we get OUR reply (color/win).
+            # Any push-event messages (opponent guess, game_ended) are put back
+            # so the main loop can process them on the next frame.
+            push_prefixes = (
+                const.MULTIPLAYER_OPPONENT_GUESS,
+                "game_ended",
+                const.MULTIPLAYER_OPPONENT_WON,
+            )
+            color_str = None
+            deadline = time.time() + 10
+            while time.time() < deadline:
+                try:
+                    msg = game_queue.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+                if msg and any(msg.startswith(p) for p in push_prefixes):
+                    game_queue.put(msg)   # put back for the main loop
+                else:
+                    color_str = msg
+                    break
+
+        if not color_str:
             return None
         if color_str.startswith(const.win):
             return True
