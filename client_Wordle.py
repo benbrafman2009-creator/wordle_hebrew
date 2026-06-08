@@ -17,7 +17,7 @@ import queue
 import const
 
 __author__ = "Ben"
-IP = "127.0.0.1"
+IP = "192.168.1.127"
 PORT = 8080
 SIZE_HEADER_FORMAT = "00000000|"
 size_header_size = len(SIZE_HEADER_FORMAT)
