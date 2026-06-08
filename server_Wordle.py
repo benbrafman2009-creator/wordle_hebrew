@@ -19,7 +19,7 @@ import const
 import random
 __author__ = "Ben"
 
-IP = "127.0.0.1"
+IP = "255.255.255.255"
 PORT = 8080
 SIZE_HEADER_FORMAT = "00000000|"
 size_header_size = len(SIZE_HEADER_FORMAT)
